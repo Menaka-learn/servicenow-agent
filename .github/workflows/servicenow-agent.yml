@@ -4,25 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: "Tell the agent what to do (e.g. 'create a task for deployment review')"
+        description: "Tell the agent what to do"
         required: true
         type: string
+
 permissions:
   contents: write
-  
+
 jobs:
   run-agent:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install dependencies
         run: |
