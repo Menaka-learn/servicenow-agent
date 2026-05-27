@@ -201,4 +201,240 @@ Claude infers priority automatically from context — "urgent", "prod down", "cr
 
 ---
 
+## 🧭 Detailed Architecture (Mermaid)
+
+### 1. System component diagram
+
+End-to-end view of every actor, secret store, and external system involved when a command is executed.
+
+```mermaid
+flowchart TB
+    subgraph User["👤 User"]
+        U1[Developer / Ops Engineer]
+    end
+
+    subgraph GH["🐙 GitHub"]
+        direction TB
+        WF["workflow_dispatch trigger<br/>(servicenow-agent.yml)"]
+        SEC[("🔐 GitHub Secrets<br/>ANTHROPIC_API_KEY<br/>SNOW_INSTANCE<br/>SNOW_USERNAME<br/>SNOW_PASSWORD")]
+        RUN["Ubuntu Runner<br/>Node.js 22"]
+        LOG["📜 Action Logs<br/>(stdout output)"]
+        WF --> RUN
+        SEC -. injected as env vars .-> RUN
+        RUN --> LOG
+    end
+
+    subgraph Agent["🧠 Agent Process (Node.js)"]
+        direction TB
+        IDX["index.js<br/>• Tool definitions<br/>• Agentic loop<br/>• System prompt"]
+        SNOW["servicenow.js<br/>• REST client<br/>• Basic auth<br/>• State mapping"]
+        IDX -- invokes tool fn --> SNOW
+    end
+
+    subgraph Anthropic["☁️ Anthropic API"]
+        CLAUDE["claude-sonnet-4-5<br/>• NL understanding<br/>• Tool selection<br/>• Result summarization"]
+    end
+
+    subgraph ServiceNow["🛎️ ServiceNow Instance"]
+        REST["REST API<br/>/api/now/table/sc_task"]
+        DB[("sc_task table")]
+        REST --- DB
+    end
+
+    U1 -- "1. types command" --> WF
+    RUN -- "2. spawns node process" --> IDX
+    IDX -- "3. messages.create<br/>(prompt + tools)" --> CLAUDE
+    CLAUDE -- "4. tool_use block" --> IDX
+    SNOW -- "5. HTTPS + Basic Auth" --> REST
+    REST -- "6. JSON result" --> SNOW
+    IDX -- "7. tool_result back to Claude" --> CLAUDE
+    CLAUDE -- "8. final summary" --> IDX
+    IDX -- "9. prints to stdout" --> LOG
+    LOG -- "10. user reads result" --> U1
+
+    classDef user fill:#fef3c7,stroke:#d97706,color:#000
+    classDef github fill:#e0e7ff,stroke:#4338ca,color:#000
+    classDef agent fill:#d1fae5,stroke:#059669,color:#000
+    classDef ai fill:#fce7f3,stroke:#be185d,color:#000
+    classDef snow fill:#dbeafe,stroke:#2563eb,color:#000
+    classDef secret fill:#fee2e2,stroke:#dc2626,color:#000
+
+    class U1 user
+    class WF,RUN,LOG github
+    class SEC secret
+    class IDX,SNOW agent
+    class CLAUDE ai
+    class REST,DB snow
+```
+
+---
+
+### 2. Agentic loop — sequence diagram
+
+How a single command flows turn-by-turn through Claude's tool-use loop until the model emits `end_turn`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant GH as GitHub Actions
+    participant Idx as index.js<br/>(Agent Loop)
+    participant Cla as Claude API<br/>(claude-sonnet-4-5)
+    participant Snw as servicenow.js
+    participant API as ServiceNow REST
+
+    User->>GH: Run workflow with<br/>command="create high priority<br/>task for prod outage"
+    GH->>Idx: spawn node index.js<br/>(USER_COMMAND env)
+
+    Note over Idx: Build initial messages array<br/>+ system prompt + tools
+
+    loop Agentic loop (until end_turn)
+        Idx->>Cla: messages.create(<br/>  messages, tools, system)
+        Cla-->>Idx: response with<br/>stop_reason
+
+        alt stop_reason == "tool_use"
+            Note over Idx: Extract tool_use block(s)
+            Idx->>Snw: executeTool(name, input)
+            Snw->>API: HTTPS POST/PATCH/GET<br/>+ Basic Auth header
+            API-->>Snw: JSON {sys_id, number, ...}
+            Snw-->>Idx: normalized result
+            Idx->>Idx: append tool_result<br/>to messages
+        else stop_reason == "end_turn"
+            Cla-->>Idx: final text block
+            Note over Idx: Exit loop
+        end
+    end
+
+    Idx-->>GH: print "✅ Agent Response" + ticket link
+    GH-->>User: workflow logs visible<br/>in Actions UI
+```
+
+---
+
+### 3. Tool selection decision flow
+
+How Claude picks one of the four tools based on the natural-language command.
+
+```mermaid
+flowchart LR
+    CMD["📥 User command<br/>(natural language)"] --> NLP{Claude<br/>interprets<br/>intent}
+
+    NLP -->|"create / add / open<br/>+ no ticket #"| CREATE["🆕 create_task<br/>• short_description<br/>• description<br/>• priority (1-4)"]
+    NLP -->|"update / change /<br/>set state + SCTASK#"| UPDATE["✏️ update_task<br/>• number<br/>• state<br/>• short_description?"]
+    NLP -->|"close / done /<br/>resolve + SCTASK#"| CLOSE["✅ close_task<br/>• number<br/>• resolution_notes"]
+    NLP -->|"get / show / fetch<br/>+ SCTASK#"| GET["🔍 get_task<br/>• number"]
+
+    CREATE --> POST["POST /sc_task"]
+    UPDATE --> PATCH["PATCH /sc_task/{sys_id}<br/>(after lookup by number)"]
+    CLOSE --> PATCH
+    GET --> SEARCH["GET /sc_task?number=..."]
+
+    POST --> SN[("ServiceNow<br/>sc_task table")]
+    PATCH --> SN
+    SEARCH --> SN
+
+    SN --> RESULT["📦 Normalized result<br/>{sys_id, number,<br/>state, priority, link}"]
+    RESULT --> SUMMARY["💬 Claude summarizes<br/>and emits end_turn"]
+
+    classDef cmd fill:#fef3c7,stroke:#d97706,color:#000
+    classDef decision fill:#fce7f3,stroke:#be185d,color:#000
+    classDef tool fill:#d1fae5,stroke:#059669,color:#000
+    classDef http fill:#e0e7ff,stroke:#4338ca,color:#000
+    classDef snow fill:#dbeafe,stroke:#2563eb,color:#000
+
+    class CMD cmd
+    class NLP,SUMMARY decision
+    class CREATE,UPDATE,CLOSE,GET tool
+    class POST,PATCH,SEARCH http
+    class SN,RESULT snow
+```
+
+---
+
+### 4. State & priority mapping (data view)
+
+Reference for the magic numbers ServiceNow uses on the `sc_task` table — these are what `servicenow.js` translates user-friendly words into.
+
+```mermaid
+flowchart LR
+    subgraph PRI["Priority field (priority)"]
+        direction TB
+        P1["1 → Critical"] --- P2["2 → High"] --- P3["3 → Moderate (default)"] --- P4["4 → Low"]
+    end
+
+    subgraph STA["State field (state)"]
+        direction TB
+        S1["1 → Open"] --- S2["2 → Work in Progress"] --- S3["3 → Closed Complete"] --- S4["4 → Closed Incomplete"]
+    end
+
+    subgraph WORDS["Words Claude/users use"]
+        direction TB
+        W1["'urgent', 'prod down', 'critical' → 1/2"]
+        W2["'in progress', 'wip' → 2"]
+        W3["'closed', 'done', 'complete' → 3"]
+        W4["'incomplete', 'cancelled' → 4"]
+    end
+
+    WORDS -. mapped by .-> STA
+    WORDS -. inferred by Claude .-> PRI
+
+    classDef pri fill:#fee2e2,stroke:#dc2626,color:#000
+    classDef sta fill:#dbeafe,stroke:#2563eb,color:#000
+    classDef words fill:#fef3c7,stroke:#d97706,color:#000
+
+    class P1,P2,P3,P4,PRI pri
+    class S1,S2,S3,S4,STA sta
+    class W1,W2,W3,W4,WORDS words
+```
+
+---
+
+### 5. Secrets & trust boundaries
+
+Where each credential lives, who can read it, and how it crosses trust boundaries at runtime.
+
+```mermaid
+flowchart TB
+    subgraph Boundary1["🔒 GitHub trust boundary"]
+        direction TB
+        S1["GitHub Secrets store<br/>(encrypted at rest,<br/>not readable after save)"]
+        S1 -- "injected ONLY at job runtime<br/>as masked env vars" --> RUN2["Ephemeral runner<br/>(destroyed after job)"]
+    end
+
+    subgraph Boundary2["☁️ Anthropic trust boundary"]
+        ANT["Anthropic API endpoint<br/>(receives prompt + tools,<br/>NEVER receives SNOW creds)"]
+    end
+
+    subgraph Boundary3["🛎️ ServiceNow trust boundary"]
+        SNT["ServiceNow REST API<br/>(receives Basic Auth header,<br/>NEVER receives Anthropic key)"]
+    end
+
+    RUN2 -- "Bearer: ANTHROPIC_API_KEY" --> ANT
+    RUN2 -- "Basic: USER:PASS<br/>over HTTPS" --> SNT
+
+    Note1["⚠️ No credential is ever<br/>written to disk or logs.<br/>Runner is wiped after each run."]
+    RUN2 -.-> Note1
+
+    classDef boundary fill:#fee2e2,stroke:#dc2626,color:#000,stroke-dasharray: 5 5
+    classDef secret fill:#fef3c7,stroke:#d97706,color:#000
+    classDef ext fill:#e0e7ff,stroke:#4338ca,color:#000
+    classDef note fill:#f3f4f6,stroke:#6b7280,color:#000,stroke-dasharray: 2 2
+
+    class Boundary1,Boundary2,Boundary3 boundary
+    class S1,RUN2 secret
+    class ANT,SNT ext
+    class Note1 note
+```
+
+---
+
+### How to read these diagrams
+
+- **Diagram 1** answers *"what are all the moving parts?"* — use it to onboard new teammates.
+- **Diagram 2** answers *"what happens in time?"* — use it to debug an agent run that misbehaves.
+- **Diagram 3** answers *"why did Claude pick this tool?"* — use it when adding a new tool.
+- **Diagram 4** answers *"what do these numbers mean in ServiceNow?"* — use it when extending state/priority handling.
+- **Diagram 5** answers *"is this secure?"* — use it for any security review or audit conversation.
+
+> 💡 GitHub renders Mermaid natively in Markdown — no extra setup needed. To edit, paste any block into [mermaid.live](https://mermaid.live).
 
