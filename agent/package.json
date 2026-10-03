@@ -5,7 +5,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:jira": "node --env-file=.env jira-agent.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0"
